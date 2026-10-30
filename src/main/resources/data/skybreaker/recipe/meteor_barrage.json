@@ -1,0 +1,16 @@
+{
+	"type": "minecraft:crafting_shaped",
+	"category": "equipment",
+	"key": {
+		"M": "minecraft:magma_block",
+		"F": "minecraft:fire_charge",
+		"S": "minecraft:netherite_scrap",
+		"P": "minecraft:ender_pearl"
+	},
+	"pattern": [
+		"FMF",
+		"SPS",
+		"FMF"
+	],
+	"result": { "id": "skybreaker:meteor_barrage", "count": 1 }
+}

@@ -1,0 +1,21 @@
+{
+	"schemaVersion": 1,
+	"id": "skybreaker",
+	"version": "${version}",
+	"name": "Skybreaker: Orbital Arsenal",
+	"description": "Orbital Railgun, Satellite Laser and Meteor Barrage. Aim, wait for the countdown, and call down the sky.",
+	"authors": ["Skybreaker"],
+	"license": "MIT",
+	"icon": "assets/skybreaker/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"main": ["com.skybreaker.SkybreakerMod"],
+		"client": ["com.skybreaker.client.SkybreakerClient"]
+	},
+	"depends": {
+		"fabricloader": ">=0.19.0",
+		"minecraft": "~26.3",
+		"java": ">=25",
+		"fabric-api": "*"
+	}
+}

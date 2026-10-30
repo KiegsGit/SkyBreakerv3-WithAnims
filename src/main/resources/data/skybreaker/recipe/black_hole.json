@@ -1,0 +1,16 @@
+{
+	"type": "minecraft:crafting_shaped",
+	"category": "equipment",
+	"key": {
+		"C": "minecraft:crying_obsidian",
+		"S": "minecraft:echo_shard",
+		"E": "minecraft:ender_eye",
+		"N": "minecraft:nether_star"
+	},
+	"pattern": [
+		"CSC",
+		"ENE",
+		"CSC"
+	],
+	"result": { "id": "skybreaker:black_hole", "count": 1 }
+}
