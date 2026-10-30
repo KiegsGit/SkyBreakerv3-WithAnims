@@ -1,0 +1,16 @@
+{
+	"type": "minecraft:crafting_shaped",
+	"category": "equipment",
+	"key": {
+		"N": "minecraft:netherite_ingot",
+		"B": "minecraft:beacon",
+		"R": "minecraft:lightning_rod",
+		"D": "minecraft:diamond_block"
+	},
+	"pattern": [
+		"DRN",
+		"RBR",
+		"NRD"
+	],
+	"result": { "id": "skybreaker:orbital_railgun", "count": 1 }
+}
