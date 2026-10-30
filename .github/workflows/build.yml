@@ -1,0 +1,46 @@
+name: Build Skybreaker
+
+# Runs on every push, and can be started manually from the "Actions" tab.
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v5
+        with:
+          java-version: '25'
+          distribution: 'microsoft'
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Build
+        run: ./gradlew build --no-daemon
+
+      - name: Show output
+        run: ls -la build/libs
+
+      - name: Upload jar as workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: skybreaker-26.3
+          path: build/libs/skybreaker-26.3.jar
+
+      - name: Publish jar to a GitHub Release (direct .jar download)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest build/libs/skybreaker-26.3.jar \
+            --title "Skybreaker: Orbital Arsenal 26.3" \
+            --notes "Drop skybreaker-26.3.jar (and Fabric API) into your mods folder."
