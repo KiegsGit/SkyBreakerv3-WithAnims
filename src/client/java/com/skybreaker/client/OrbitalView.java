@@ -45,6 +45,51 @@ final class OrbitalView {
 		}
 	}
 
+	/** Pre-built list of merged rectangles (x, y, w, h, argb) so a frame only needs a few hundred fills. */
+	private static final class Baked {
+		int n = 0;
+		int[] d = new int[5 * 256];
+
+		void add(int x, int y, int w, int h, int c) {
+			if (n * 5 + 5 > d.length) {
+				d = java.util.Arrays.copyOf(d, d.length * 2);
+			}
+			int i = n * 5;
+			d[i] = x;
+			d[i + 1] = y;
+			d[i + 2] = w;
+			d[i + 3] = h;
+			d[i + 4] = c;
+			n++;
+		}
+
+		void draw(GuiGraphicsExtractor g, int ox, int oy, float oa) {
+			for (int k = 0; k < n; k++) {
+				int i = k * 5;
+				int c = d[i + 4];
+				int a = (int) ((c >>> 24) * oa);
+				if (a <= 0) {
+					continue;
+				}
+				g.fill(ox + d[i], oy + d[i + 1], ox + d[i] + d[i + 2], oy + d[i + 1] + d[i + 3], (a << 24) | (c & 0xFFFFFF));
+			}
+		}
+	}
+
+	private static Baked globeB;
+	private static int globeW = -1, globeH = -1;
+	private static final Baked[] satB = new Baked[5];
+	private static final float[] satTipX = new float[5];
+	private static final float[] satTipY = new float[5];
+	private static int satW = -1, satH = -1;
+
+	// adaptive quality: 0 = best, 2 = lightest. Drops automatically when the frame rate dips.
+	private static final int[] CS_DIV = {80, 50, 32};
+	private static final int[] MERGE_TOL = {46, 60, 84};
+	private static int quality = 1;
+	private static long lastNs = 0L;
+	private static float avgMs = 16f;
+
 	private static final Part[][] MODELS = new Part[5][];
 	private static final float[] tmp2 = new float[2];
 	private static final float[] hitOut = new float[3];
@@ -202,14 +247,74 @@ final class OrbitalView {
 
 	// ------------------------------------------------------------------------------------------------ Earth
 
-	private static void globe(GuiGraphicsExtractor g, int w, int h, int cs, float gcx, float gcy, float R, float spin, float tilt, float oa, int age) {
+	private static int qcol(float r, float g, float b, int a, int step) {
+		int h = step / 2;
+		int ri = Math.min(255, ((int) Math.max(0, r) / step) * step + h);
+		int gi = Math.min(255, ((int) Math.max(0, g) / step) * step + h);
+		int bi = Math.min(255, ((int) Math.max(0, b) / step) * step + h);
+		int ai = a >= 224 ? 255 : (a < 24 ? 0 : (a / 32) * 32 + 16);
+		return (ai << 24) | (ri << 16) | (gi << 8) | bi;
+	}
+
+	private static boolean near(int a, int b, int tol) {
+		if ((a >>> 24) != (b >>> 24)) {
+			return false;
+		}
+		return Math.abs(((a >> 16) & 255) - ((b >> 16) & 255)) <= tol && Math.abs(((a >> 8) & 255) - ((b >> 8) & 255)) <= tol
+			&& Math.abs((a & 255) - (b & 255)) <= tol;
+	}
+
+	/** Greedy rectangle cover of a colour grid (0 = empty); cells within tol of the start colour are merged. */
+	private static void mergeGrid(Baked out, int[] grid, int cols, int rows, int cs, int ox, int oy, int tol) {
+		boolean[] used = new boolean[cols * rows];
+		for (int j = 0; j < rows; j++) {
+			for (int i = 0; i < cols; i++) {
+				int idx = j * cols + i;
+				int c = grid[idx];
+				if (c == 0 || used[idx]) {
+					continue;
+				}
+				int wd = 1;
+				while (i + wd < cols && grid[idx + wd] != 0 && near(grid[idx + wd], c, tol) && !used[idx + wd]) {
+					wd++;
+				}
+				int ht = 1;
+				boolean ok = true;
+				while (j + ht < rows && ok) {
+					for (int k = 0; k < wd; k++) {
+						int q = (j + ht) * cols + i + k;
+						if (grid[q] == 0 || !near(grid[q], c, tol) || used[q]) {
+							ok = false;
+							break;
+						}
+					}
+					if (ok) {
+						ht++;
+					}
+				}
+				for (int y = 0; y < ht; y++) {
+					for (int x = 0; x < wd; x++) {
+						used[(j + y) * cols + i + x] = true;
+					}
+				}
+				out.add(ox + i * cs, oy + j * cs, wd * cs, ht * cs, c);
+			}
+		}
+	}
+
+	/** Bakes the lit Earth (with atmosphere glow) once; the result is replayed every frame. */
+	private static Baked bakeGlobe(int w, int h, int cs, float gcx, float gcy, float R, float spin, float tilt) {
 		float ct = (float) Math.cos(tilt);
 		float st = (float) Math.sin(tilt);
-		int y0 = (int) Math.max(0, gcy - R * 1.1f);
-		int shift = (int) (age * 0.15f);
-		for (int py = y0; py < h; py += cs) {
+		int y0 = (int) Math.max(0, gcy - R * 1.1f) / cs * cs;
+		int cols = w / cs + 1;
+		int rows = (h - y0) / cs + 1;
+		int[] grid = new int[cols * rows];
+		for (int j = 0; j < rows; j++) {
+			int py = y0 + j * cs;
 			float ny = -(py + cs * 0.5f - gcy) / R;
-			for (int px = 0; px < w; px += cs) {
+			for (int i = 0; i < cols; i++) {
+				int px = i * cs;
 				float nx = (px + cs * 0.5f - gcx) / R;
 				float d2 = nx * nx + ny * ny;
 				if (d2 >= 1.19f) {
@@ -220,7 +325,7 @@ final class OrbitalView {
 					float t = (dd - 1f) / 0.09f;
 					float a = (1f - t) * (1f - t);
 					float lf = Math.max(0.1f, Math.min(1f, 0.35f + 0.9f * (nx * LX + ny * LY) / dd));
-					g.fill(px, py, px + cs, py + cs, argb((int) (150 * a * lf * oa), 0x5CB8FF));
+					grid[j * cols + i] = qcol(0x5C, 0xB8, 0xFF, (int) (150 * a * lf), 24);
 					continue;
 				}
 				float nz = (float) Math.sqrt(1f - d2);
@@ -249,7 +354,7 @@ final class OrbitalView {
 						b += 255 * sp;
 					}
 				}
-				float c = sm(0.52f, 0.72f, cloud[tj * TW + ((ti + shift) & (TW - 1))]);
+				float c = sm(0.52f, 0.72f, cloud[tj * TW + ((ti + 20) & (TW - 1))]);
 				float cl = (0.12f + 0.88f * diff) * 255f;
 				r = r * (1f - c * 0.85f) + cl * c * 0.85f;
 				gg = gg * (1f - c * 0.85f) + cl * c * 0.85f;
@@ -264,12 +369,13 @@ final class OrbitalView {
 				r += 60 * rim;
 				gg += 140 * rim;
 				b += 235 * rim;
-				g.fill(px, py, px + cs, py + cs, argb((int) (255 * oa), rgbf(r, gg, b)));
+				grid[j * cols + i] = qcol(r, gg, b, 255, 16);
 			}
 		}
+		Baked out = new Baked();
+		mergeGrid(out, grid, cols, rows, cs, 0, y0, MERGE_TOL[quality]);
+		return out;
 	}
-
-	// ------------------------------------------------------------------------------------------------ 3D models
 
 	private static float[] mul(float[] a, float[] b) {
 		float[] o = new float[9];
@@ -337,18 +443,17 @@ final class OrbitalView {
 		return tmin;
 	}
 
-	private static void model(GuiGraphicsExtractor g, Part[] parts, float[] m, float s, float posX, float posY, float ext, int cs, float oa, int age) {
-		float rad = ext * s;
-		int x0 = (int) (posX - rad);
-		int x1 = (int) (posX + rad);
-		int y0 = (int) (posY - rad);
-		int y1 = (int) (posY + rad);
+	/** Ray-casts the 3D satellite model once into merged rectangles, relative to the satellite centre. */
+	private static Baked bakeModel(Part[] parts, float[] m, float s, float ext, int cs) {
+		int n = (int) (2f * ext * s / cs) + 2;
+		int[] grid = new int[n * n];
+		float half = n * cs / 2f;
 		float hlen = (float) Math.sqrt(LX * LX + LY * LY + (LZ + 1f) * (LZ + 1f));
 		float dx = -m[6], dy = -m[7], dz = -m[8];
-		for (int py = y0; py < y1; py += cs) {
-			float v = -(py + cs * 0.5f - posY) / s;
-			for (int px = x0; px < x1; px += cs) {
-				float u = (px + cs * 0.5f - posX) / s;
+		for (int j = 0; j < n; j++) {
+			float v = -(j * cs + cs * 0.5f - half) / s;
+			for (int i = 0; i < n; i++) {
+				float u = (i * cs + cs * 0.5f - half) / s;
 				float ox = m[0] * u + m[3] * v + m[6] * 20f;
 				float oy = m[1] * u + m[4] * v + m[7] * 20f;
 				float oz = m[2] * u + m[5] * v + m[8] * 20f;
@@ -378,13 +483,9 @@ final class OrbitalView {
 				int base = bp.rgb;
 				float r, gg, b;
 				if (bp.mat == 2) {
-					float pulse = 0.85f + 0.15f * (float) Math.sin(age * 0.5);
-					r = ((base >> 16) & 255) * pulse;
-					gg = ((base >> 8) & 255) * pulse;
-					b = (base & 255) * pulse;
-					r += 60;
-					gg += 60;
-					b += 60;
+					r = ((base >> 16) & 255) + 60;
+					gg = ((base >> 8) & 255) + 60;
+					b = (base & 255) + 60;
 				} else {
 					float hx = ox + dx * best - bp.x;
 					float hz = oz + dz * best - bp.z;
@@ -400,9 +501,12 @@ final class OrbitalView {
 					gg = ((base >> 8) & 255) * lit + 255 * sp * (bp.mat == 1 ? 0.7f : 0.45f);
 					b = (base & 255) * lit + 255 * sp * 0.5f + 18f * (1f - diff);
 				}
-				g.fill(px, py, px + cs, py + cs, argb((int) (255 * oa), rgbf(r, gg, b)));
+				grid[j * n + i] = qcol(r, gg, b, 255, 20);
 			}
 		}
+		Baked out = new Baked();
+		mergeGrid(out, grid, n, n, cs, (int) -half, (int) -half, 12);
+		return out;
 	}
 
 	private static float[] proj(float[] m, float s, float posX, float posY, float lx, float ly, float lz) {
@@ -415,16 +519,19 @@ final class OrbitalView {
 
 	// ------------------------------------------------------------------------------------------------ drawing helpers
 
-	private static void line(GuiGraphicsExtractor g, float x0, float y0, float x1, float y1, int thick, int step, int color) {
+	/** One rotated rectangle instead of hundreds of tiny squares. */
+	private static void bar(GuiGraphicsExtractor g, float x0, float y0, float x1, float y1, int thick, int color) {
 		float dx = x1 - x0;
 		float dy = y1 - y0;
-		int n = Math.max(1, (int) (Math.max(Math.abs(dx), Math.abs(dy)) / step));
-		int half = thick / 2;
-		for (int i = 0; i <= n; i++) {
-			int x = (int) (x0 + dx * i / n);
-			int y = (int) (y0 + dy * i / n);
-			g.fill(x - half, y - half, x - half + thick, y - half + thick, color);
+		int len = (int) Math.ceil(Math.sqrt(dx * dx + dy * dy));
+		if (len < 1) {
+			return;
 		}
+		g.pose().pushMatrix();
+		g.pose().translate(x0, y0);
+		g.pose().rotate((float) Math.atan2(dy, dx));
+		g.fill(0, -thick / 2, len, thick - thick / 2, color);
+		g.pose().popMatrix();
 	}
 
 	private static void glowDot(GuiGraphicsExtractor g, float x, float y, int r, int rgb, float oa, float k) {
@@ -441,59 +548,59 @@ final class OrbitalView {
 		g.fill((int) cx + r - thick, (int) cy - r, (int) cx + r, (int) cy + r, color);
 	}
 
-	private static void rock(GuiGraphicsExtractor g, float cx, float cy, float rad, float spin, float oa, float heat) {
-		int cs = Math.max(1, (int) (rad / 5f));
-		int ri = (int) Math.ceil(rad);
-		for (int py = (int) cy - ri; py <= (int) cy + ri; py += cs) {
-			for (int px = (int) cx - ri; px <= (int) cx + ri; px += cs) {
-				float nx = (px + cs * 0.5f - cx) / rad;
-				float ny = -(py + cs * 0.5f - cy) / rad;
-				float d2 = nx * nx + ny * ny;
-				if (d2 >= 1f) {
-					continue;
-				}
-				float nz = (float) Math.sqrt(1f - d2);
-				float lon = (float) Math.atan2(nx, nz) + spin;
-				float u = lon / (2f * PI);
-				u -= (float) Math.floor(u);
-				int ti = Math.min(TW - 1, (int) (u * TW));
-				int tj = Math.max(0, Math.min(TH - 1, (int) ((0.5f - (float) Math.asin(ny) / PI) * TH)));
-				float bump = height[tj * TW + ti];
-				float dot = Math.max(0f, nx * LX + ny * LY + nz * LZ);
-				float k = (0.12f + 0.88f * dot) * (0.45f + 0.9f * bump);
-				float r = 118 * k, gg = 100 * k, b = 86 * k;
-				float edge = heat * (1f - nz);
-				r += 255 * edge;
-				gg += 120 * edge;
-				b += 30 * edge;
-				g.fill(px, py, px + cs, py + cs, argb((int) (255 * oa), rgbf(r, gg, b)));
+	private static void discFill(GuiGraphicsExtractor g, float cx, float cy, float r, int step, int color) {
+		for (int y = (int) -r; y < (int) r; y += step) {
+			float yy = y + step * 0.5f;
+			int hw = (int) Math.sqrt(Math.max(0f, r * r - yy * yy));
+			if (hw > 0) {
+				g.fill((int) cx - hw, (int) cy + y, (int) cx + hw, (int) cy + y + step, color);
 			}
 		}
 	}
 
+	/** Cheap lit rock: three shaded discs instead of a per-pixel sphere. */
+	private static void rock(GuiGraphicsExtractor g, float cx, float cy, float rad, float oa, float heat) {
+		int step = Math.max(2, (int) (rad / 3f));
+		discFill(g, cx, cy, rad, step, argb((int) (255 * oa), mix(0x4A3E36, 0xB04A18, heat * 0.5f)));
+		discFill(g, cx - rad * 0.12f, cy - rad * 0.12f, rad * 0.78f, step, argb((int) (255 * oa), 0x7A6A5A));
+		discFill(g, cx - rad * 0.28f, cy - rad * 0.3f, rad * 0.38f, step, argb((int) (255 * oa), 0xB4A48E));
+	}
+
+	/** Accretion disk drawn as tilted rows (one pose rotation, a few dozen fills). */
 	private static void disk(GuiGraphicsExtractor g, float cx, float cy, float r, float oa, int age, boolean front) {
-		float tilt = -0.22f;
-		float ct = (float) Math.cos(tilt), st = (float) Math.sin(tilt);
-		int x0 = (int) (cx - 3.8f * r), x1 = (int) (cx + 3.8f * r);
-		int y0 = (int) (cy - 1.9f * r), y1 = (int) (cy + 1.9f * r);
-		for (int py = y0; py < y1; py += 2) {
-			for (int px = x0; px < x1; px += 2) {
-				float dx = px - cx, dy = py - cy;
-				float xr = dx * ct + dy * st;
-				float yr = (-dx * st + dy * ct) / 0.28f;
-				float rho = (float) Math.sqrt(xr * xr + yr * yr);
-				if (rho < 1.35f * r || rho > 3.6f * r || (yr > 0f) != front) {
-					continue;
-				}
-				float rn = (rho - 1.35f * r) / (2.25f * r);
-				float ang = (float) Math.atan2(yr, xr);
-				float swirl = 0.65f + 0.35f * (float) Math.sin(ang * 3f - age * 0.3f + rn * 9f);
-				float dop = 0.7f + 0.5f * cl((-xr / Math.max(1f, rho) + 1f) * 0.5f);
-				int col = mix(mix(0xFFF2D0, 0xFF8A20, cl(rn * 1.5f)), 0x6A1A5A, cl((rn - 0.45f) * 1.8f));
-				float a = 235f * swirl * dop * (1f - rn * 0.75f) * cl((rho - 1.35f * r) / (0.15f * r));
-				g.fill(px, py, px + 2, py + 2, argb((int) (a * oa), col));
+		float ro = 3.6f * r;
+		float ri = 1.35f * r;
+		g.pose().pushMatrix();
+		g.pose().translate(cx, cy);
+		g.pose().rotate(-0.22f);
+		int step = Math.max(2, (int) (r / 9f));
+		for (int y = (int) (-0.28f * ro); y < (int) (0.28f * ro); y += step) {
+			boolean isFront = y >= 0;
+			if (isFront != front) {
+				continue;
+			}
+			float yy = y + step * 0.5f;
+			float fo = yy / (0.28f * ro);
+			float xo = ro * (float) Math.sqrt(Math.max(0f, 1f - fo * fo));
+			float fi = yy / (0.28f * ri);
+			float xi = Math.abs(fi) < 1f ? ri * (float) Math.sqrt(1f - fi * fi) : 0f;
+			if (xo <= xi + 1f) {
+				continue;
+			}
+			float swirl = 0.7f + 0.3f * (float) Math.sin(y * 0.4f + age * 0.3f);
+			float span = xo - xi;
+			for (int side = -1; side <= 1; side += 2) {
+				float dop = side < 0 ? 1f : 0.7f;
+				int a1 = (int) (235 * swirl * dop * oa);
+				int a2 = (int) (190 * swirl * dop * oa);
+				int a3 = (int) (110 * swirl * dop * oa);
+				float p0 = xi, p1 = xi + span * 0.3f, p2 = xi + span * 0.65f, p3 = xo;
+				g.fill((int) (side * p0 - (side < 0 ? (p1 - p0) : 0)), y, (int) (side * p0 + (side > 0 ? (p1 - p0) : 0)), y + step, argb(a1, 0xFFF0C8));
+				g.fill((int) (side * p1 - (side < 0 ? (p2 - p1) : 0)), y, (int) (side * p1 + (side > 0 ? (p2 - p1) : 0)), y + step, argb(a2, 0xFF9030));
+				g.fill((int) (side * p2 - (side < 0 ? (p3 - p2) : 0)), y, (int) (side * p2 + (side > 0 ? (p3 - p2) : 0)), y + step, argb(a3, 0x8A2070));
 			}
 		}
+		g.pose().popMatrix();
 	}
 
 	private static void blackHole(GuiGraphicsExtractor g, float cx, float cy, float r, float oa, int age) {
@@ -501,32 +608,25 @@ final class OrbitalView {
 			return;
 		}
 		disk(g, cx, cy, r, oa, age, false);
-		for (int py = (int) (cy - r); py < (int) (cy + r); py += 2) {
-			float dy = py + 1 - cy;
-			if (Math.abs(dy) >= r) {
-				continue;
-			}
-			int hw = (int) Math.sqrt(r * r - dy * dy);
-			g.fill((int) cx - hw, py, (int) cx + hw, py + 2, argb((int) (255 * oa), 0x000000));
+		discFill(g, cx, cy, r, 2, argb((int) (255 * oa), 0x000000));
+		// photon ring + lensed arc over the top
+		float pr = 1.12f * r;
+		for (int y = (int) -pr; y < (int) pr; y += 2) {
+			float yy = y + 1f;
+			int hw = (int) Math.sqrt(Math.max(0f, pr * pr - yy * yy));
+			int a = (int) (230 * oa);
+			g.fill((int) cx - hw - 1, (int) cy + y, (int) cx - hw + 2, (int) cy + y + 2, argb(a, 0xFFB060));
+			g.fill((int) cx + hw - 2, (int) cy + y, (int) cx + hw + 1, (int) cy + y + 2, argb(a, 0xFFB060));
 		}
-		// photon ring + the lensed top arc of the far side of the disk
-		for (int py = (int) (cy - 1.7f * r); py < (int) (cy + 1.4f * r); py += 2) {
-			for (int px = (int) (cx - 1.7f * r); px < (int) (cx + 1.7f * r); px += 2) {
-				float dx = px - cx, dy = py - cy;
-				float rho = (float) Math.sqrt(dx * dx + dy * dy);
-				float k = 0f;
-				if (Math.abs(rho - 1.12f * r) < 1.6f) {
-					k = 1f;
-				} else if (dy < 0f && rho > 1.12f * r && rho < 1.65f * r) {
-					k = 0.8f * (1f - (rho - 1.12f * r) / (0.53f * r)) * (0.7f + 0.3f * (float) Math.sin(dx * 0.25f - age * 0.3f));
-				} else if (dy > 0f && rho > 1.12f * r && rho < 1.3f * r) {
-					k = 0.35f * (1f - (rho - 1.12f * r) / (0.18f * r));
-				}
-				if (k > 0f) {
-					g.fill(px, py, px + 2, py + 2, argb((int) (230 * k * oa), 0xFFB060));
-				}
-			}
+		float lr = 1.45f * r;
+		for (int y = (int) -lr; y < (int) (-0.35f * r); y += 2) {
+			float yy = y + 1f;
+			int hw = (int) Math.sqrt(Math.max(0f, lr * lr - yy * yy));
+			int a = (int) (130 * oa);
+			g.fill((int) cx - hw - 1, (int) cy + y, (int) cx - hw + 2, (int) cy + y + 2, argb(a, 0xFF9A40));
+			g.fill((int) cx + hw - 2, (int) cy + y, (int) cx + hw + 1, (int) cy + y + 2, argb(a, 0xFF9A40));
 		}
+		g.fill((int) (cx - lr * 0.55f), (int) (cy - lr) - 1, (int) (cx + lr * 0.55f), (int) (cy - lr) + 2, argb((int) (150 * oa), 0xFFB060));
 		disk(g, cx, cy, r, oa, age, true);
 	}
 
@@ -569,35 +669,84 @@ final class OrbitalView {
 		}
 		int remaining = Math.max(0, total - age);
 		int accent = ACCENT[weapon];
-		int cs = Math.max(2, Math.round(h / 130f));
+
+		// ---- frame-time watchdog: step quality down if the view is dragging the frame rate ----
+		long nowNs = System.nanoTime();
+		if (age == 0) {
+			lastNs = 0L;
+			avgMs = 16f;
+		}
+		if (lastNs != 0L) {
+			float dt = (nowNs - lastNs) / 1_000_000f;
+			if (dt < 400f) {
+				avgMs = avgMs * 0.88f + dt * 0.12f;
+			}
+		}
+		lastNs = nowNs;
+		if (age > 6 && age % 6 == 0 && avgMs > 38f && quality < 2) {
+			quality++;
+			avgMs = 20f;
+			globeB = null;
+			satW = -1;
+		}
+
+		float gcx = w * 0.42f;
+		float gcy = h * 1.55f;
+		float R = h * 1.05f;
+		float tX = w * 0.47f;
+		float tY = h * 0.70f;
+		int sx = (int) (w * 0.82f);
+		int sy0 = (int) (h * 0.15f);
+		float s = h * 0.03f;
+
+		// ---- one-time bake (re-done only when the window size changes) ----
+		if (globeB == null || globeW != w || globeH != h) {
+			int cs = Math.max(3, Math.round(h / (float) CS_DIV[quality]));
+			globeB = bakeGlobe(w, h, cs, gcx, gcy, R, 0.9f, 0.38f);
+			globeW = w;
+			globeH = h;
+		}
+		if (satW != w || satH != h) {
+			float ux = tX - sx;
+			float uy = -(tY - (float) sy0);
+			float len = (float) Math.max(1.0, Math.sqrt(ux * ux + uy * uy));
+			float th = (float) Math.atan2(ux / len, -(uy / len));
+			float[] m = rot(th, 0.55f, 0.6f);
+			for (int wp = 1; wp <= 4; wp++) {
+				if (wp == 3) {
+					continue;
+				}
+				float ext = wp == 1 ? 6.4f : 5.4f;
+				satB[wp] = bakeModel(MODELS[wp], m, s, ext, Math.max(2, Math.round(h / 135f)) + (quality >= 2 ? 1 : 0));
+				float tipLen = wp == 1 ? 4.7f : (wp == 4 ? 2.1f : 1.65f);
+				float[] tp = proj(m, s, 0f, 0f, 0f, -tipLen, 0f);
+				satTipX[wp] = tp[0];
+				satTipY[wp] = tp[1];
+			}
+			satW = w;
+			satH = h;
+		}
 
 		// ---- space ----
 		g.fill(0, 0, w, h, argb((int) (255 * oa), 0x02040C));
 		for (int i = 0; i < 6; i++) {
 			g.fill(0, h * i / 6, w, h * (i + 1) / 6, argb((int) (60 * oa), mix(0x050A1E, 0x0A1030, i / 5f)));
 		}
-		for (int i = 0; i < 130; i++) {
-			int sx = (hash(i * 3) % Math.max(1, w) + (int) (age * (0.02f + (i % 3) * 0.02f))) % Math.max(1, w);
-			int sy = hash(i * 3 + 1) % Math.max(1, h);
-			float tw = 0.5f + 0.5f * (float) Math.sin(age * 0.2 + i);
-			int a = (int) ((90 + 140 * tw) * oa * (0.4f + 0.6f * (hash(i * 3 + 2) % 100) / 100f));
-			int sz = hash(i * 7) % 11 == 0 ? 2 : 1;
-			g.fill(sx, sy, sx + sz, sy + sz, argb(a, 0xDDEEFF));
+		for (int i = 0; i < (quality == 0 ? 60 : 30); i++) {
+			int stx = hash(i * 3) % Math.max(1, w);
+			int sty = hash(i * 3 + 1) % Math.max(1, (int) (h * 0.7f));
+			int a = (int) ((110 + 110 * ((age / 6 + i) % 3 == 0 ? 0.4f : 1f)) * oa);
+			int sz = hash(i * 7) % 9 == 0 ? 2 : 1;
+			g.fill(stx, sty, stx + sz, sty + sz, argb(a, 0xDDEEFF));
 		}
 
-		// ---- Earth ----
-		float gcx = w * 0.42f;
-		float gcy = h * 1.55f;
-		float R = h * 1.05f * (1f + 0.05f * prog);
-		globe(g, w, h, cs, gcx, gcy, R, 0.9f + age * 0.006f, 0.38f, oa, age);
-
-		float tX = w * 0.47f;
-		float tY = h * 0.70f;
+		// ---- Earth (pre-baked) ----
+		globeB.draw(g, 0, 0, oa);
 
 		// ---- tactical grid over the target area ----
 		int gx0 = (int) tX - 90, gx1 = (int) tX + 90, gy0 = (int) tY - 62, gy1 = (int) tY + 62;
 		int gridA = (int) ((38 + 28 * Math.sin(age * 0.2)) * oa);
-		for (int x = gx0; x <= gx1; x += 10) {
+		for (int x = gx0; quality < 2 && x <= gx1; x += (quality == 0 ? 15 : 30)) {
 			float dxx = x - gcx;
 			float lim = (float) Math.sqrt(Math.max(0, R * R - dxx * dxx));
 			int ya = (int) Math.max(gy0, gcy - lim);
@@ -605,7 +754,7 @@ final class OrbitalView {
 				g.fill(x, ya, x + 1, gy1, argb(gridA, 0xA0F0FF));
 			}
 		}
-		for (int y = gy0; y <= gy1; y += 10) {
+		for (int y = gy0; quality < 2 && y <= gy1; y += (quality == 0 ? 15 : 30)) {
 			float dyy = y - gcy;
 			float lim = (float) Math.sqrt(Math.max(0, R * R - dyy * dyy));
 			int xa = (int) Math.max(gx0, gcx - lim);
@@ -619,21 +768,12 @@ final class OrbitalView {
 
 		// ---- weapon scene ----
 		if (weapon == 3) {
-			meteors(g, w, h, tX, tY, prog, oa, age);
+			meteors(g, w, h, tX, tY, prog, oa);
 		} else {
-			int sx = (int) (w * 0.82f);
-			int sy = (int) (h * 0.15f + Math.sin(age * 0.1) * 1.5);
-			float s = h * 0.03f;
-			float ux = tX - sx;
-			float uy = -(tY - sy);
-			float len = (float) Math.max(1.0, Math.sqrt(ux * ux + uy * uy));
-			float th = (float) Math.atan2(ux / len, -(uy / len));
-			float[] m = rot(th, 0.55f, 0.6f + 0.25f * (float) Math.sin(age * 0.04));
-			float ext = weapon == 1 ? 6.4f : 5.4f;
-			model(g, MODELS[weapon], m, s, sx, sy, ext, 2, oa, age);
-			float tipLen = weapon == 1 ? 4.7f : (weapon == 4 ? 2.1f : 1.65f);
-			float[] tp = proj(m, s, sx, sy, 0f, -tipLen, 0f);
-			float ex = tp[0], ey = tp[1];
+			int sy = sy0 + (int) Math.round(Math.sin(age * 0.1) * 1.5);
+			satB[weapon].draw(g, sx, sy, oa);
+			float ex = sx + satTipX[weapon];
+			float ey = sy + satTipY[weapon];
 
 			if (weapon == 2 || weapon == 4) {
 				float beamP = cl((prog - 0.18f) / 0.30f);
@@ -645,10 +785,10 @@ final class OrbitalView {
 				if (beamP > 0f) {
 					float bx = ex + (destX - ex) * beamP;
 					float by = ey + (destY - ey) * beamP;
-					line(g, ex, ey, bx, by, 9, 2, argb((int) (40 * oa * pulse), bc));
-					line(g, ex, ey, bx, by, 5, 2, argb((int) (110 * oa * pulse), bc));
-					line(g, ex, ey, bx, by, 3, 1, argb((int) (230 * oa), bc2));
-					line(g, ex, ey, bx, by, 1, 1, argb((int) (255 * oa), 0xFFF0F0));
+					bar(g, ex, ey, bx, by, 9, argb((int) (40 * oa * pulse), bc));
+					bar(g, ex, ey, bx, by, 5, argb((int) (110 * oa * pulse), bc));
+					bar(g, ex, ey, bx, by, 3, argb((int) (230 * oa), bc2));
+					bar(g, ex, ey, bx, by, 1, argb((int) (255 * oa), 0xFFF0F0));
 				}
 				glowDot(g, ex, ey, 3 + (int) (5 * prog), bc, oa, pulse);
 				if (weapon == 2 && beamP >= 1f) {
@@ -662,27 +802,25 @@ final class OrbitalView {
 				// orbital railgun: charge, fire a tungsten rod, impact
 				float charge = cl(prog / 0.45f);
 				glowDot(g, ex, ey, 2 + (int) (6 * charge), 0xFFB030, oa, pulse);
-				int arcs = (int) (charge * 6);
+				int arcs = (int) (charge * 4);
 				for (int i = 0; i < arcs; i++) {
-					float a = hash(age * 13 + i) % 628 / 100f;
+					float an = hash(age * 13 + i) % 628 / 100f;
 					float l = 6 + hash(age * 7 + i) % 14;
-					line(g, ex, ey, ex + (float) Math.cos(a) * l, ey + (float) Math.sin(a) * l, 1, 1, argb((int) (220 * oa), 0xFFE9A0));
+					bar(g, ex, ey, ex + (float) Math.cos(an) * l, ey + (float) Math.sin(an) * l, 1, argb((int) (220 * oa), 0xFFE9A0));
 				}
 				float e = cl((prog - 0.45f) / 0.45f);
 				if (prog >= 0.45f && e < 1f) {
 					float ee = e * e;
 					float px = ex + (tX - ex) * ee;
 					float py = ey + (tY - ey) * ee;
-					float dx = (tX - ex) / Math.max(1f, (float) Math.hypot(tX - ex, tY - ey));
-					float dy = (tY - ey) / Math.max(1f, (float) Math.hypot(tX - ex, tY - ey));
+					float dl = Math.max(1f, (float) Math.hypot(tX - ex, tY - ey));
+					float dx = (tX - ex) / dl;
+					float dy = (tY - ey) / dl;
 					float trail = 24f + 90f * e;
-					for (int k = 0; k < 8; k++) {
-						float f0 = k / 8f;
-						line(g, px - dx * trail * f0, py - dy * trail * f0, px - dx * trail * (f0 + 0.125f), py - dy * trail * (f0 + 0.125f),
-							Math.max(1, (int) (7 * (1f - f0))), 2, argb((int) (150 * (1f - f0) * oa), 0xFF7A20));
-					}
-					line(g, px - dx * 14f, py - dy * 14f, px, py, 3, 1, argb((int) (240 * oa), 0xFFD890));
-					line(g, px - dx * 14f, py - dy * 14f, px, py, 1, 1, argb((int) (255 * oa), 0xFFFFFF));
+					bar(g, px - dx * trail, py - dy * trail, px, py, 7, argb((int) (70 * oa), 0xFF7A20));
+					bar(g, px - dx * trail * 0.6f, py - dy * trail * 0.6f, px, py, 4, argb((int) (130 * oa), 0xFF9A30));
+					bar(g, px - dx * 14f, py - dy * 14f, px, py, 3, argb((int) (240 * oa), 0xFFD890));
+					bar(g, px - dx * 14f, py - dy * 14f, px, py, 1, argb((int) (255 * oa), 0xFFFFFF));
 					glowDot(g, px, py, 3, 0xFFB030, oa, 1f);
 					if (e < 0.08f) {
 						glowDot(g, ex, ey, 14, 0xFFE0A0, oa, 1f - e / 0.08f);
@@ -702,35 +840,25 @@ final class OrbitalView {
 		bracket(g, (int) tX + rs, (int) tY - rs, 7, -1, 1, rc);
 		bracket(g, (int) tX - rs, (int) tY + rs, 7, 1, -1, rc);
 		bracket(g, (int) tX + rs, (int) tY + rs, 7, -1, -1, rc);
-		g.fill((int) tX - rs - 8, (int) tY, (int) tX - rs + 2, (int) tY + 1, rc);
-		g.fill((int) tX + rs - 2, (int) tY, (int) tX + rs + 8, (int) tY + 1, rc);
-		g.fill((int) tX, (int) tY - rs - 8, (int) tX + 1, (int) tY - rs + 2, rc);
-		g.fill((int) tX, (int) tY + rs - 2, (int) tX + 1, (int) tY + rs + 8, rc);
 		textL(g, "TGT", (int) tX + rs + 6, (int) tY - rs - 2, argb((int) (220 * oa), 0xFFFFFF));
 
-		// ---- side HUD arcs ----
+		// ---- side HUD arcs (dashed segments) ----
 		int arcTop = (int) (h * 0.12f), arcBot = (int) (h * 0.88f);
 		int arcCol = argb((int) (200 * oa), 0x40D8F0);
-		int arcDim = argb((int) (90 * oa), 0x40D8F0);
-		for (int y = arcTop; y < arcBot; y += 2) {
+		for (int y = arcTop; y < arcBot; y += 8) {
+			if ((y / 8) % 6 == 5) {
+				continue;
+			}
 			float u = (y - h / 2f) / (h * 0.38f);
 			int ax = (int) (w * 0.045f + u * u * w * 0.035f);
-			if ((y / 8) % 6 != 5) {
-				g.fill(ax, y, ax + 2, y + 2, arcCol);
-				g.fill(w - ax - 2, y, w - ax, y + 2, arcCol);
-			}
-			int bxo = ax + 8;
-			g.fill(bxo, y, bxo + 1, y + 2, arcDim);
-			g.fill(w - bxo - 1, y, w - bxo, y + 2, arcDim);
+			g.fill(ax, y, ax + 2, y + 8, arcCol);
+			g.fill(w - ax - 2, y, w - ax, y + 8, arcCol);
 		}
 		for (int k = 0; k < 4; k++) {
 			int yy = (int) (h * 0.30f) + k * 7;
 			g.fill((int) (w * 0.06f), yy, (int) (w * 0.06f) + 10, yy + 4, argb((int) ((120 + 100 * ((age / 4 + k) % 2)) * oa), 0x50E8FF));
 			g.fill(w - (int) (w * 0.06f) - 10, yy, w - (int) (w * 0.06f), yy + 4, argb((int) ((120 + 100 * ((age / 4 + k + 1) % 2)) * oa), 0x50E8FF));
 		}
-		int redCol = argb((int) (230 * oa), 0xFF4050);
-		g.fill((int) (w * 0.035f), h / 2, (int) (w * 0.035f) + 9, h / 2 + 1, redCol);
-		g.fill(w - (int) (w * 0.035f) - 9, h / 2, w - (int) (w * 0.035f), h / 2 + 1, redCol);
 
 		// ---- readouts ----
 		int cyan = argb((int) (240 * oa), 0xBFF2FF);
@@ -745,7 +873,6 @@ final class OrbitalView {
 		int rx = (int) (w * 0.93f);
 		textR(g, ALIGN[weapon] + ": " + align, rx, (int) (h * 0.30f), cyan);
 		g.fill(rx - 120, (int) (h * 0.30f) + 11, rx, (int) (h * 0.30f) + 12, argb((int) (160 * oa), accent));
-		textR(g, ALIGN[weapon] + ": " + align, rx, h - 33, cyan);
 		textR(g, "IMPACT: T-MINUS " + String.format(Locale.ROOT, "%.1f", remaining / 20f) + " SECONDS", rx, h - 22, white);
 
 		// ---- warning panel ----
@@ -759,14 +886,8 @@ final class OrbitalView {
 		boolean blink = (age / 5) % 2 == 0 || prog < 0.12f;
 		int red = argb((int) (255 * oa), blink ? mix(accent, 0xFFFFFF, 0.15f) : mix(accent, 0x000000, 0.25f));
 		g.fill(px, py, px + pw, py + ph, argb((int) (170 * oa), 0x101820));
-		g.fill(px, py, px + pw, py + 1, argb((int) (110 * oa), 0x8090A0));
-		g.fill(px, py + ph - 1, px + pw, py + ph, argb((int) (110 * oa), 0x8090A0));
 		g.fill(px - 2, py - 2, px + 14, py - 1, red);
 		g.fill(px - 2, py - 2, px - 1, py + 14, red);
-		g.fill(px + pw - 14, py - 2, px + pw + 2, py - 1, red);
-		g.fill(px + pw + 1, py - 2, px + pw + 2, py + 14, red);
-		g.fill(px - 2, py + ph + 1, px + 14, py + ph + 2, red);
-		g.fill(px - 2, py + ph - 14, px - 1, py + ph + 2, red);
 		g.fill(px + pw - 14, py + ph + 1, px + pw + 2, py + ph + 2, red);
 		g.fill(px + pw + 1, py + ph - 14, px + pw + 2, py + ph + 2, red);
 		textScaledL(g, "WARNING:", px + 8, py + 6, 1.2f, red);
@@ -778,19 +899,16 @@ final class OrbitalView {
 		textL(g, "TARGET: " + tgx + " " + tgy + " " + tgz + "  RNG " + distance + "m", px + 8, ul + 6, white);
 		textL(g, "STATUS: " + status, px + 8, ul + 17, prog >= 0.8f ? red : cyan);
 
-		// ---- scanlines + glitch at the cut-in ----
-		for (int y = 0; y < h; y += 3) {
-			g.fill(0, y, w, y + 1, argb((int) (26 * oa), 0x000000));
-		}
+		// ---- glitch at the cut-in ----
 		if (age < 12 && age % 2 == 1) {
 			int gy = hash(age * 11) % Math.max(1, h - 10);
 			g.fill(0, gy, w, gy + 3 + hash(age) % 6, argb((int) (60 * oa), 0x7FE8FF));
 		}
 	}
 
-	private static void meteors(GuiGraphicsExtractor g, int w, int h, float tX, float tY, float prog, float oa, int age) {
-		for (int i = 0; i < 7; i++) {
-			float t0 = 0.04f + i * 0.085f;
+	private static void meteors(GuiGraphicsExtractor g, int w, int h, float tX, float tY, float prog, float oa) {
+		for (int i = 0; i < 6; i++) {
+			float t0 = 0.04f + i * 0.095f;
 			float q = (prog - t0) / 0.55f;
 			if (q <= 0f) {
 				continue;
@@ -815,15 +933,11 @@ final class OrbitalView {
 			float dy = (ey - sy) / len;
 			float rad = rad0 * (0.5f + 1.4f * q);
 			float trail = 40f + 140f * q;
-			for (int k = 0; k < 10; k++) {
-				float f0 = k / 10f;
-				float f1 = (k + 1) / 10f;
-				int thick = Math.max(2, (int) (rad * 1.7f * (1f - f0)));
-				line(g, px - dx * trail * f0, py - dy * trail * f0, px - dx * trail * f1, py - dy * trail * f1, thick, 2,
-					argb((int) (140 * (1f - f0) * oa), f0 < 0.4f ? 0xFF9A30 : 0xFF4A18));
-			}
-			glowDot(g, px, py, (int) (rad * 1.3f), 0xFF7A20, oa, 0.8f);
-			rock(g, px, py, rad, age * 0.05f + i, oa, 0.9f);
+			bar(g, px - dx * trail, py - dy * trail, px, py, Math.max(3, (int) (rad * 1.6f)), argb((int) (60 * oa), 0xFF4A18));
+			bar(g, px - dx * trail * 0.65f, py - dy * trail * 0.65f, px, py, Math.max(2, (int) (rad * 1.1f)), argb((int) (110 * oa), 0xFF7A20));
+			bar(g, px - dx * trail * 0.3f, py - dy * trail * 0.3f, px, py, Math.max(1, (int) (rad * 0.6f)), argb((int) (190 * oa), 0xFFC070));
+			glowDot(g, px, py, (int) (rad * 1.3f), 0xFF7A20, oa, 0.7f);
+			rock(g, px, py, rad, oa, 0.9f);
 		}
 	}
 
